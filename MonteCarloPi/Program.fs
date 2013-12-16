@@ -7,13 +7,17 @@ open MathNet.Numerics.Random
 open System.Linq
 open System.Collections.Generic
 open QuantLib
+open RDotNet
+open RProvider
+open RProvider.``base``
+open RProvider.``stats``
 
 type RNGMethod =
 | BuiltIn = 0
 | MathDotNet = 1
 | AlgLib = 2
 | QuantLib = 3
-
+| RProvider = 4
 
 
 type ParalMeth =
@@ -67,10 +71,12 @@ let getRnd meth =
                 dicSR.[id]
         rngBI.NextDouble()
 
-let piEstimate meth parMeth arr : float =
+let piEstimate meth parMeth c : float =
+
     match parMeth with
     
     | ParalMeth.ArrayParallel -> 
+        let arr = (Array.init c id)
         let insideCount = ref 0
         arr |> Array.Parallel.map
             (fun i ->
@@ -85,7 +91,8 @@ let piEstimate meth parMeth arr : float =
         4.0 * float(insideCount.Value) / float(arr.Length)
 
     | ParalMeth.PLINQ ->
-        let arr = arr
+        // PLINQ throws for BuiltIn, MDN and QL. Interesting that AlgLib doesn't thow under any conditions and the fastest
+        let arr = (Array.init c id)
         let insideCount = arr.AsParallel().WithDegreeOfParallelism(4).Sum(fun x -> 
                 let x = getRnd meth
                 let y = getRnd meth
@@ -94,21 +101,38 @@ let piEstimate meth parMeth arr : float =
             )
         4.0 * float(insideCount) / float(arr.Length)
     | ParalMeth.Seq ->
-        let insideCount = ref 0
-        let rng = new UniformRandomGenerator()
-        let seqGen = new UniformRandomSequenceGenerator(uint32(arr.Length), rng)
-        let xs = seqGen.nextSequence().value()
-        let ys = seqGen.nextSequence().value() 
-        let res = 
-            (xs, ys) ||> Seq.map2
-                (fun x y ->
-                    let len = Math.Sqrt(x * x + y * y)
-                    if len < 1.0 then 
-                        Interlocked.Increment(&insideCount.contents) |> ignore
-                ) 
-            |> Seq.toArray |> ignore
-        4.0 * float(insideCount.Value) / float(arr.Length)
+        match meth with
+        | RNGMethod.QuantLib ->
+            let insideCount = ref 0
+            let rng = new UniformRandomGenerator()
+            let seqGen = new UniformRandomSequenceGenerator(uint32(c), rng)
+            let xs = seqGen.nextSequence().value()
+            let ys = seqGen.nextSequence().value() 
+            let res = 
+                (xs, ys) ||> Seq.map2
+                    (fun x y ->
+                        let len = Math.Sqrt(x * x + y * y)
+                        if len < 1.0 then 
+                            Interlocked.Increment(&insideCount.contents) |> ignore
+                    ) 
+                |> Seq.toArray |> ignore
+            4.0 * float(insideCount.Value) / float(c)
+        | RNGMethod.RProvider ->
+            
+            let eval (text:string) =
+                R.eval(R.parse(namedParams ["text", text ]))
+
+            let xs = R.runif(c) 
+            let ys = R.runif(c)     
+            let xs' = R.assign("xs", xs) 
+            let ys' = R.assign("ys", ys) 
+            let expr = eval("sum((sqrt(xs*xs + ys*ys) < 1))")
+            let insideCount = expr.AsNumeric().[0]
+            4.0 * float(insideCount) / float(c)
+
+        | _ -> raise (InvalidProgramException())
     | _ -> 
+        let arr = (Array.init c id)
         let insideCount = ref 0
         arr |> Array.map
             (fun i ->
@@ -126,55 +150,80 @@ do
     watch.Stop()
 
 
-let run meth parMeth arr =
+let run meth parMeth c =
     watch <- Stopwatch.StartNew();
-    let piEst =  (piEstimate meth parMeth arr)
+    let piEst =
+        try
+             Some(piEstimate meth parMeth c)
+        with
+        | _ -> 
+            None
     watch.Stop()
     let runtime = watch.ElapsedMilliseconds
     Console.WriteLine("RNG: {0}; Parallel: {1}", meth.ToString(), parMeth.ToString())
-    Console.WriteLine("value: {0}; error: {1}%; msec: {2}",
-        piEst.ToString(), (100.0 * Math.Round((piEst/Math.PI - 1.0), 5)).ToString(),
-        runtime.ToString()
-        )
+    if piEst.IsSome then
+        Console.WriteLine("value: {0}; error: {1}%; msec: {2}",
+            piEst.ToString(), (100.0 * Math.Round((piEst.Value/Math.PI - 1.0), 5)).ToString(),
+            runtime.ToString()
+            )
+    else
+        Console.WriteLine("exception...")
+
 
 [<EntryPoint>]
 let main argv = 
 
     while true do
         let c = Int32.Parse(Console.ReadLine())
-        let arr = (Array.init c id)
+        
+        // Non-parallel is >2x slower but has no threading issues. Could make parallel at higher level if there are several independent simulations - will have simpler and more reliable code (no weird dict for memoization)
 
-        run RNGMethod.BuiltIn ParalMeth.Seq arr
+        // NB1: should compare Seq method with single-threaded! QL and R do their job in one thread
+        // NB2: RProvider needs a warmup, first run is way too slow
 
-        run RNGMethod.BuiltIn ParalMeth.None arr
+        Console.WriteLine("")
+        Console.WriteLine("Count: {0}", c.ToString())
+
+        // Single thread
+        Console.WriteLine("Single thread")
+        run RNGMethod.BuiltIn ParalMeth.None c
         dicSR.Clear()
-        run RNGMethod.BuiltIn ParalMeth.ArrayParallel arr
+        run RNGMethod.AlgLib ParalMeth.None c
+        dicAL.Clear()
+        run RNGMethod.MathDotNet ParalMeth.None c
+        dicMDN.Clear()
+        run RNGMethod.QuantLib ParalMeth.None c
+        dicQL.Clear()
+        Console.WriteLine("")
+        Console.WriteLine("Single thread, generate seqs")
+        run RNGMethod.RProvider ParalMeth.Seq c
+        run RNGMethod.QuantLib ParalMeth.Seq c
+        Console.WriteLine("")
+
+        // Parallel
+        Console.WriteLine("Parallel")
+        run RNGMethod.BuiltIn ParalMeth.ArrayParallel c
         dicSR.Clear()
-        run RNGMethod.BuiltIn ParalMeth.PLINQ arr
-        dicSR.Clear()
-
-        run RNGMethod.AlgLib ParalMeth.None arr
+        run RNGMethod.AlgLib ParalMeth.ArrayParallel c
         dicAL.Clear()
-        run RNGMethod.AlgLib ParalMeth.ArrayParallel arr
-        dicAL.Clear()
-        run RNGMethod.AlgLib ParalMeth.PLINQ arr
-        dicAL.Clear()
-
-
-        run RNGMethod.MathDotNet ParalMeth.None arr
+        run RNGMethod.MathDotNet ParalMeth.ArrayParallel c
         dicMDN.Clear()
-        run RNGMethod.MathDotNet ParalMeth.ArrayParallel arr
-        dicMDN.Clear()
-        run RNGMethod.MathDotNet ParalMeth.PLINQ arr
-        dicMDN.Clear()
+        run RNGMethod.QuantLib ParalMeth.ArrayParallel c
+        dicQL.Clear()
 
 
-        run RNGMethod.QuantLib ParalMeth.None arr
-        dicQL.Clear()
-        run RNGMethod.QuantLib ParalMeth.ArrayParallel arr
-        dicQL.Clear()
-        run RNGMethod.QuantLib ParalMeth.PLINQ arr
-        dicQL.Clear()
+
+// exclude PLINQ because it throws (need more accurate threading with RNG or smth else?) 
+//        run RNGMethod.BuiltIn ParalMeth.PLINQ c
+//        dicSR.Clear()
+//        run RNGMethod.AlgLib ParalMeth.PLINQ c
+//        dicAL.Clear()
+//        run RNGMethod.MathDotNet ParalMeth.PLINQ c
+//        dicMDN.Clear()
+//        run RNGMethod.QuantLib ParalMeth.PLINQ c
+//        dicQL.Clear()
+
+        
 
 
     printfn "%A" argv
