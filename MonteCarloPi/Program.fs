@@ -123,7 +123,7 @@ let main argv =
         Console.WriteLine("ThreadLocal simple")
         run RNGMethod.ThreadLocal ParalMeth.Simple c
         Console.WriteLine("ThreadLocal AV")
-        run RNGMethod.Naive ParalMeth.AV c
+        run RNGMethod.ThreadLocal ParalMeth.AV c
 
 
     printfn "%A" argv
